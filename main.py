@@ -1,29 +1,55 @@
-"""Dip-reversion bot for the make.fun btc-race-24h bounty (bars-replay/v1).
+"""Staged dip-reversion bot for the make.fun btc-race-24h bounty
+(bars-replay/v1). This is v2: it replaces the single all-in buy of v1
+with two tranches that scale into a sharp drop instead of catching the
+whole falling knife at once.
 
-Strategy, in one paragraph: cbBTC 1-minute returns are near-unpredictable
-at short horizons but sharp 1-hour drops tend to bounce back over the next
-couple of hours, while small drops are usually just the start of more
-downside and the 4-hour trend is a mean-reverter. So the bot only buys
-after a big, fast drop, holds the bounce for at most two hours, and cuts
-the position if it falls another 1% from the entry close. If the whole day
-passes without a single big drop, a late-window fallback buys a half-size
-position after a 4-hour drop so the entry still makes at least one trade.
+The idea, in one paragraph: a one-hour drop of about two percent in
+cbBTC usually bounces, but the first sign of it is not the bottom --
+on the dev window the price slid another percent after the first
+signal before turning. So the bot only risks a quarter of its cash on
+the first signal (a 60-minute log return below -2.2%), and only commits
+the rest when the drop deepens to -2.8%, which on the dev window is
+exactly where the bottom was. The whole position is then held for at
+most two hours from the first fill, with a 1.5% stop under the
+notional-weighted average entry as insurance against the drop turning
+into a crash. If the day passes with no sharp drop at all, a late
+fallback buys half the cash after a four-hour drift below -1%, so the
+entry still trades at least once.
 
-Numbers (dev window, 1,440 1-min bars of cbBTC/USDC, 2026-11-14 08:28 UTC
-to 2026-11-15 08:28 UTC, exact harness economics: 4 bps fee, 2 bps
-slippage, price impact, fills at the next bar's open):
-  net PnL +$38.63 on $1,000 (3.86%), 2 fills (1 round trip), max
-  drawdown 1.48%. The buy-and-hold baseline on the same window is -$44.
-  Neighbouring parameter choices (drop 2.0-2.8%, hold 120-240 min, stop
-  0.8-1.5%) all stay between +$5 and +$43, so the result is a plateau of
-  the same family, not one lucky threshold. The fallback alone, had the
-  primary never fired, makes +$0.64 on the dev window.
+Dev window (1,440 1-minute bars of cbBTC/USDC, 2026-11-14 08:28 UTC to
+2026-11-15 08:28 UTC; exact harness economics: 4 bps fee, 2 bps
+slippage, constant-product impact, fills at the next bar's open):
+  net PnL +$46.31 on $1,000 (4.63%), 3 fills (2 buys, 1 sell), max
+  drawdown 0.53%. v1 on the same window made +$38.63 with a 1.47%
+  drawdown, so v2 is +$7.68 better and about three times calmer.
 
-Rules: long only, at most one open position, full cash on the primary
-signal (max_weight_bps is 10000), half cash on the fallback, at most one
-order per batch. Deterministic: decisions are a pure function of the
-closes seen so far plus the account state; no clock, no network, no
-randomness, no files.
+Why this is a plateau, not a lucky threshold (grid search over the
+same exact engine):
+  first tranche 0.10-0.50 of cash -> +$44.35 to +$47.20, smooth;
+  second threshold -2.7% or -2.8% -> +$45.70 / +$46.31;
+  first threshold -2.1% or -2.2% -> +$46.31 either way;
+  hold 110-130 bars -> +$40.95 to +$46.31;
+  stop 1%, 1.5%, 2% or none -> +$46.31 (it never fires on dev).
+  Variants that were tried and REJECTED because they lost money on
+  dev: a 30-minute detection window (best +$8.88), a trailing stop or
+  partial take-profit (both cut the bounce short), and RSI / Bollinger
+  / bounce confirmations (they delay the entry past the bottom).
+  The one genuine cliff is the second threshold: at -2.9% it never
+  fires and only the first tranche trades (+$10.32). That is the
+  honest trade-off of the design -- if the race window's drop is
+  shallower, v2 still trades the first tranche and stays profitable,
+  it just does not get the cheap second one.
+
+Race-window risk, stated plainly: everything depends on whether the
+next 24 hours contain a sharp drop with a bounce, like the dev
+window's. A shallower drop (-2.2% to -2.7%) still leaves a small
+profit from the first tranche; no drop at all leaves only the
+fallback; a drop that keeps crashing is capped by the 1.5% stop.
+
+Rules: long only, at most one open position, at most one order per
+batch, at most one round per window. Deterministic: every decision is
+a pure function of the closes seen so far and the account state; no
+clock, no network, no randomness, no files.
 """
 
 import math
@@ -34,106 +60,168 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ven
 
 import makefun_bars
 
-SYMBOL = "CBBTC"
+ASSET = "CBBTC"
 
-# Primary signal: 60-minute log return below -2.2%.
-DROP_WINDOW = 60
-DROP_THRESHOLD = -0.022
+# One hour of closes defines a "drop": the log return over this span.
+SPAN = 60
+# First tranche: a quarter of the cash on a -2.2% hourly drop.
+FIRST_DIP = -0.022
+FIRST_SHARE = 0.25
+# Second tranche: the rest of the cash if the drop deepens to -2.8%.
+SECOND_DIP = -0.028
 
-# Exit: 1% below the entry close, or 120 bars after the fill, whichever
-# comes first. No take-profit: the bounce is allowed to run until the
-# time exit.
-STOP_LOSS = 0.01
-MAX_HOLD_BARS = 120
+# One round lives at most this many bars from its first fill, and is
+# cut if the close falls this far under the average entry close.
+HOLD_LIMIT = 120
+STOP_FRAC = 0.015
 
-# Fallback: if no primary trade has happened yet, from batch 1080 on buy
-# half the cash when the 240-minute log return is below -1%.
-FALLBACK_BAR = 1080
-FALLBACK_WINDOW = 240
-FALLBACK_THRESHOLD = -0.01
-FALLBACK_FRACTION = 0.5
+# Late safety net: from this batch on, with no buy yet, a half-size
+# position after a -1% drift over four hours.
+LATE_BATCH = 1080
+DRIFT_SPAN = 240
+DRIFT_FLOOR = -0.01
+LATE_SHARE = 0.5
 
-MIN_NOTIONAL = 1_000_000  # quote units, from the competition caps
-MAX_SLIPPAGE_BPS = 100
+FLOOR_NOTIONAL = 1_000_000  # quote units: the $1 minimum from the caps
+SLIPPAGE_CAP = 100  # bps, from the competition caps
 
 
-class DipReversionBot:
-    def __init__(self):
-        self.log_closes = []
-        self.entry_close = None
-        self.held_bars = 0
-        self.trades = 0
+def make_handler():
+    """Return the per-batch callback. All mutable state lives in the
+    closure dict below, so nothing leaks between runs."""
 
-    def _buy(self, state, fraction):
-        amount = int(state.cash * fraction)
-        if amount < MIN_NOTIONAL:
+    # closes: log closes seen so far, oldest first.
+    # tranche: 0 = nothing bought yet, 1 = first tranche filled,
+    #   2 = second tranche filled (round fully invested).
+    # pending: (notional, close) of a buy order sent on the previous
+    #   batch and not yet known filled; folded into the average entry
+    #   once the position actually appears.
+    # spent / entry_num: notional-weighted average entry close of the
+    #   filled buys: entry = entry_num / spent.
+    # bars_held: batches with a position open, counting from the fill.
+    # buys: number of buys that actually filled (gates the fallback).
+    # last_qty: position size at the previous batch, used to tell a
+    #   filled buy (qty grew) from a rejected one (qty unchanged).
+    # finished: the round (or the fallback) is over; trade no more.
+    s = {
+        "closes": [],
+        "tranche": 0,
+        "pending": None,
+        "spent": 0,
+        "entry_num": 0,
+        "bars_held": 0,
+        "buys": 0,
+        "last_qty": 0,
+        "finished": False,
+    }
+
+    def avg_entry():
+        if s["spent"] <= 0:
+            return None
+        return s["entry_num"] / s["spent"]
+
+    def drop_over(span):
+        """Log return of the latest close over the last `span` bars."""
+        hist = s["closes"]
+        if len(hist) <= span:
+            return None
+        return hist[-1] - hist[-1 - span]
+
+    def send_buy(state, notional):
+        """Queue a buy of `notional` quote units, remembering it as
+        pending so the average entry only counts it once filled."""
+        if notional < FLOOR_NOTIONAL:
             return []
-        self.entry_close = state.close(SYMBOL)
-        self.trades += 1
+        s["pending"] = (notional, state.close(ASSET))
         return [
             {
                 "side": "buy",
-                "symbol": SYMBOL,
-                "notional_quote_units": amount,
-                "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                "symbol": ASSET,
+                "notional_quote_units": int(notional),
+                "max_slippage_bps": SLIPPAGE_CAP,
             }
         ]
 
-    def on_batch(self, state, batch):
-        close = state.close(SYMBOL)
+    def send_sell(state, qty):
+        s["finished"] = True
+        return [
+            {
+                "side": "sell",
+                "symbol": ASSET,
+                "qty": qty,
+                "max_slippage_bps": SLIPPAGE_CAP,
+            }
+        ]
+
+    def tick(state, batch):
+        close = state.close(ASSET)
         if close is None:
             return []
-        self.log_closes.append(math.log(close))
+        s["closes"].append(math.log(close))
 
-        position = state.positions.get(SYMBOL)
-        qty = position.qty if position is not None else 0
+        held = state.positions.get(ASSET)
+        qty = held.qty if held is not None else 0
 
         if qty > 0:
-            self.held_bars += 1
-            entry = self.entry_close if self.entry_close is not None else close
-            # Stop-loss first: if the drop keeps dropping, get out before
-            # the time exit would. Both exits are all-or-nothing sells.
-            if close <= entry * (1 - STOP_LOSS):
-                return [
-                    {
-                        "side": "sell",
-                        "symbol": SYMBOL,
-                        "qty": qty,
-                        "max_slippage_bps": MAX_SLIPPAGE_BPS,
-                    }
-                ]
-            if self.held_bars >= MAX_HOLD_BARS:
-                return [
-                    {
-                        "side": "sell",
-                        "symbol": SYMBOL,
-                        "qty": qty,
-                        "max_slippage_bps": MAX_SLIPPAGE_BPS,
-                    }
-                ]
+            # A pending buy has landed only if the position grew since
+            # the previous batch. A rejected buy (max slippage, weight)
+            # leaves the size unchanged: drop it uncounted so the
+            # average entry is never polluted and the tranche can be
+            # tried again on a later batch.
+            if s["pending"] is not None:
+                if qty > s["last_qty"]:
+                    notional, at_close = s["pending"]
+                    s["entry_num"] += notional * at_close
+                    s["spent"] += notional
+                    s["buys"] += 1
+                    s["tranche"] += 1
+                s["pending"] = None
+            s["last_qty"] = qty
+            s["bars_held"] += 1
+
+            entry = avg_entry()
+            if entry is None:
+                entry = close
+            # Stop first: a drop that keeps dropping is cut before the
+            # time exit would sell it.
+            if close <= entry * (1 - STOP_FRAC):
+                return send_sell(state, qty)
+            if s["bars_held"] >= HOLD_LIMIT:
+                return send_sell(state, qty)
+            # Still room and still falling: scale in the second tranche.
+            # Capped by the weight room so a rising mark between the
+            # tranches can never trip the engine's max-weight reject.
+            if s["tranche"] == 1:
+                dip = drop_over(SPAN)
+                if dip is not None and dip < SECOND_DIP:
+                    room = state.weight_room(ASSET)
+                    return send_buy(state, min(state.cash, room))
             return []
 
-        self.held_bars = 0
-        self.entry_close = None
-        n = len(self.log_closes)
+        # Flat. A pending buy that never filled was rejected: drop it
+        # and let the trigger fire again on a later batch.
+        s["pending"] = None
+        s["bars_held"] = 0
+        s["spent"] = 0
+        s["entry_num"] = 0
+        s["last_qty"] = 0
+        if s["finished"]:
+            return []
 
-        # Primary signal: a sharp 60-minute drop.
-        if n > DROP_WINDOW:
-            drop = self.log_closes[-1] - self.log_closes[-1 - DROP_WINDOW]
-            if drop < DROP_THRESHOLD:
-                return self._buy(state, 1.0)
+        # First tranche: a sharp hourly drop, a quarter of the cash.
+        dip = drop_over(SPAN)
+        if s["tranche"] == 0 and dip is not None and dip < FIRST_DIP:
+            return send_buy(state, int(state.cash * FIRST_SHARE))
 
-        # Fallback: insure at least one trade late in the window.
-        if (
-            self.trades == 0
-            and state.seq >= FALLBACK_BAR
-            and n > FALLBACK_WINDOW
-        ):
-            drift = self.log_closes[-1] - self.log_closes[-1 - FALLBACK_WINDOW]
-            if drift < FALLBACK_THRESHOLD:
-                return self._buy(state, FALLBACK_FRACTION)
+        # Late safety net, only when nothing ever bought.
+        if s["buys"] == 0 and state.seq >= LATE_BATCH:
+            drift = drop_over(DRIFT_SPAN)
+            if drift is not None and drift < DRIFT_FLOOR:
+                return send_buy(state, int(state.cash * LATE_SHARE))
 
         return []
 
+    return tick
 
-makefun_bars.run(DipReversionBot().on_batch)
+
+makefun_bars.run(make_handler())
